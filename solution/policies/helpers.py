@@ -31,7 +31,7 @@ class UnionFind:
             if self.rank[root_i] < self.rank[root_j]:
                 self.parent[root_i] = root_j
             elif self.rank[root_i] > self.rank[root_j]:
-                self.parent[root_j] = root_i      
+                self.parent[root_j] = root_i
             else:
                 self.parent[root_j] = root_i
                 self.rank[root_i] += 1
@@ -257,6 +257,54 @@ def load_trip(core: List[str], parcel: Dict[str, Dict], context: Dict) -> Tuple[
         current_load += p_size
 
     return order, members
+
+
+def add_filler(
+    order: List[str],
+    members: Dict[str, List[str]],
+    expired_ids: List[str],
+    parcel: Dict[str, Dict],
+    capacity: float
+) -> None:
+    """In-place helper to update members with eligible expired parcels.
+
+    Time complexity: O(S + P + E), where S is len(order), P is parcels already on the
+    truck, and E is len(expired_ids).
+    """
+    if not expired_ids or not order:
+        return
+
+    stops = set(order)
+    on_board = set()
+    used = 0.0
+
+    for stop in order:
+        for pid in members.get(stop, []):
+            on_board.add(pid)
+            used += parcel[pid]["size"]
+
+    remaining = capacity - used
+    if remaining <= rounding_off:
+        return
+
+    for pid in expired_ids:
+        if pid in on_board:
+            continue
+
+        info = parcel[pid]
+        stop = info["delivery_location_id"]
+        if stop not in stops:
+            continue
+
+        size = info["size"]
+        if size > remaining + rounding_off:
+            continue
+
+        members.setdefault(stop, []).append(pid)
+        on_board.add(pid)
+        remaining -= size
+        if remaining <= rounding_off:
+            break
 
 
 def flatten(order: List[str], members: Dict[str, List[str]]) -> List[str]:
