@@ -1,7 +1,9 @@
 """Region-based dispatch policy module.
 
-This module provides spatial partitioning via Union-Find and region-building
-utilities to cluster delivery locations into connected geographic regions.
+Groups delivery locations into regions with union-find, queues waiting parcels by
+region and window type, sends a queue at its last valid planning round, loads only
+parcels that stay on time, serves the biggest loads first when trucks are short
+(truck load algorithm), and carries expired parcels as filler.
 
 Time Complexities:
 ------------------
@@ -19,8 +21,11 @@ build_regions(distances, threshold_km):
       where R is the number of regions and M is the maximum size of a region.
     - Overall Complexity: O(N^2) time complexity, computed once and cached.
 
+Queue, timer, trigger, loading and filler functions list their own time complexity
+in their docstrings.
+
 dispatch(parcel, context):
-    Placeholder dispatch function. Time complexity: O(1).
+    Calls plan_trip once. See plan_trip for its time complexity.
 """
 
 from dataclasses import dataclass, field
@@ -29,13 +34,14 @@ import math
 
 HUB = "HUB"
 PLANNING_INTERVAL = 10.0
-EPS = 1e-6
+rounding_off = 1e-9
 
 
 @dataclass(frozen=True)
 class RegionConfig:
-    """Configuration parameters for region building."""
+    """Configuration parameters for region building and dispatch triggers."""
     region_threshold_km: float = 10.0
+    fill_threshold_share: Optional[float] = None
 
 
 class UnionFind:
@@ -118,9 +124,9 @@ def build_regions(distances: Dict[str, Dict[str, float]], threshold_km: float) -
 
 def window_type(record: Dict[str, float], return_cutoff: float) -> str:
     """Classify delivery window into 'afternoon', 'open', or 'tight'. Time complexity: O(1)."""
-    if record["delivery_window_start"] > record["arrival_time"] + EPS:
+    if record["delivery_window_start"] > record["arrival_time"] + rounding_off:
         return "afternoon"
-    if record["delivery_window_end"] >= return_cutoff - EPS:
+    if record["delivery_window_end"] >= return_cutoff - rounding_off:
         return "open"
     return "tight"
 
@@ -135,9 +141,9 @@ def is_expired(record: Dict[str, float], context: Dict) -> bool:
     departure = context["current_time"] + context["departure_delay"]
     location = record["delivery_location_id"]
     arrival = departure + context["travel_distance"][HUB][location]
-    if arrival > record["delivery_window_end"] + EPS:
+    if arrival > record["delivery_window_end"] + rounding_off:
         return True
-    return arrival + context["travel_distance"][location][HUB] > context["return_cutoff"] + EPS
+    return arrival + context["travel_distance"][location][HUB] > context["return_cutoff"] + rounding_off
 
 def route_length(order: List[str], distances: Dict[str, Dict[str, float]]) -> float:
     """Calculate total trip distance from HUB through ordered stops and back to HUB. Time complexity: O(S), where S is len(order)."""
@@ -195,16 +201,21 @@ def build_queues(
     parcel: Dict[str, Dict],
     context: Dict,
     region_of: Dict[str, str]
-) -> Dict[Tuple[str, str], Batch]:
-    """Group waiting parcels into queues by region and window type, then compute route timers. Time complexity: O(P + B * L^2), where P is total parcels, B is number of batches, and L is max distinct locations per batch."""
+) -> Tuple[Dict[Tuple[str, str], Batch], Dict[str, List[str]]]:
+    """Group waiting parcels into queues by region and window type (expired parcels are collected per region for filler), then compute route timers. Time complexity: O(P + B * L^2), where P is total parcels, B is number of batches, and L is max distinct locations per batch."""
     queues: Dict[Tuple[str, str], Batch] = {}
     return_cutoff = context["return_cutoff"]
     departure_delay = context["departure_delay"]
     distances = context["travel_distance"]
 
+    expired: Dict[str, List[str]] = {}
+
     for pid in sorted(parcel.keys()):
         record = parcel[pid]
-        if not is_waiting(record) or is_expired(record, context):
+        if not is_waiting(record):
+            continue
+        if is_expired(record, context):
+            expired.setdefault(region_of[record["delivery_location_id"]], []).append(pid)
             continue
 
         loc = record["delivery_location_id"]
@@ -232,7 +243,7 @@ def build_queues(
         )
         batch.latest_dispatch = min(max_dispatch_return, max_dispatch_parcels)
 
-    return queues
+    return queues, expired
 
 
 def parcel_latest_dispatch(record: Dict[str, float], context: Dict) -> float:
@@ -242,15 +253,123 @@ def parcel_latest_dispatch(record: Dict[str, float], context: Dict) -> float:
 
 def deadline_due(batch: Batch, now: float) -> bool:
     """Check if a batch must be dispatched in the current planning round. Time complexity: O(1)."""
-    return now + PLANNING_INTERVAL > batch.latest_dispatch + EPS
+    return now + PLANNING_INTERVAL > batch.latest_dispatch + rounding_off
+
+def add_filler(
+    order: List[str],
+    members: Dict[str, List[str]],
+    expired_ids: List[str],
+    parcel: Dict[str, Dict],
+    capacity: float
+) -> None:
+    """In-place helper to update members with eligible expired parcels.
+
+    Time complexity: O(S + P + E), where S is len(order), P is parcels already on the
+    truck, and E is len(expired_ids).
+    """
+    if not expired_ids or not order:
+        return
+
+    stops = set(order)
+    on_board = set()
+    used = 0.0
+
+    for stop in order:
+        for pid in members.get(stop, []):
+            on_board.add(pid)
+            used += parcel[pid]["size"]
+
+    remaining = capacity - used
+    if remaining <= rounding_off:
+        return
+
+    for pid in expired_ids:
+        if pid in on_board:
+            continue
+
+        info = parcel[pid]
+        stop = info["delivery_location_id"]
+        if stop not in stops:
+            continue
+
+        size = info["size"]
+        if size > remaining + rounding_off:
+            continue
+
+        members.setdefault(stop, []).append(pid)
+        on_board.add(pid)
+        remaining -= size
+        if remaining <= rounding_off:
+            break
+
+def is_full_enough(batch: Batch, capacity: float, share: Optional[float]) -> bool:
+    """Check if a batch meets or exceeds the fill capacity share threshold. Time complexity: O(1)."""
+    if share is None:
+        return False
+    return batch.load >= (share * capacity) - rounding_off
+
+
+def plan_trip(parcel: Dict[str, Dict], context: Dict, config: RegionConfig) -> List[str]:
+    """Select and plan a parcel trip for an available vehicle given a region configuration.
+    
+    Time complexity: O(B * L^2 + B log B + P_cand * S^2), where B is the number of batches,
+    L is max locations per batch, P_cand is candidates in a batch, and S is route stops.
+    """
+    region_of = build_regions(context["travel_distance"], config.region_threshold_km)
+    queues, expired = build_queues(parcel, context, region_of)
+    if not queues:
+        return []
+
+    now = context["current_time"]
+    capacity = context["capacity"]
+
+    # Partition batches into due queues and fill-triggered queues
+    due = [b for b in queues.values() if deadline_due(b, now)]
+    full = [
+        b for b in queues.values()
+        if b not in due and is_full_enough(b, capacity, config.fill_threshold_share)
+    ]
+
+    if not due and not full:
+        return []
+
+    # Sort due batches by urgency
+    due.sort(key=lambda b: b.latest_dispatch)
+
+    # Re-sort due batches by load if vehicle fleet is constrained
+    needed = sum(math.ceil(b.load / capacity - rounding_off) for b in due)
+    idle_count = sum(
+        1 for v_info in context["fleet"].values()
+        if v_info["available_at"] <= now + rounding_off
+    )
+    if needed > idle_count:
+        due.sort(key=lambda b: (-min(b.load, capacity), b.latest_dispatch))
+
+    # Sort full-triggered batches (earliest deadline first, tie-break by larger load)
+    full.sort(key=lambda b: (b.latest_dispatch, -b.load))
+
+    # Combine prioritized queues
+    candidate_batches = due + full
+
+    for batch in candidate_batches:
+        core = sorted(
+            batch.parcel_ids,
+            key=lambda pid: (parcel_latest_dispatch(parcel[pid], context), pid)
+        )
+        order, members = load_trip(core, parcel, context)
+        if order:
+            add_filler(order, members, expired.get(batch.region, []), parcel, capacity)
+            return flatten(order, members)
+
+    return []
 
 
 def _feasible(order: List[str], context: Dict, departure: float) -> bool:
     """Check if a route respects vehicle range and hub return cutoff limits. Time complexity: O(S), where S is len(order)."""
     r_len = route_length(order, context["travel_distance"])
-    if r_len > context["max_trip_distance_km"] + EPS:
+    if r_len > context["max_trip_distance_km"] + rounding_off:
         return False
-    return departure + r_len <= context["return_cutoff"] + EPS
+    return departure + r_len <= context["return_cutoff"] + rounding_off
 
 
 def _all_on_time(
@@ -266,7 +385,7 @@ def _all_on_time(
         arr = departure + offsets[loc]
         for pid in pids:
             p = parcel[pid]
-            if arr < p["delivery_window_start"] - EPS or arr > p["delivery_window_end"] + EPS:
+            if arr < p["delivery_window_start"] - rounding_off or arr > p["delivery_window_end"] + rounding_off:
                 return False
     return True
 
@@ -307,7 +426,7 @@ def load_trip(core: List[str], parcel: Dict[str, Dict], context: Dict) -> Tuple[
     for pid in core:
         p = parcel[pid]
         p_size = p["size"]
-        if current_load + p_size > capacity + EPS:
+        if current_load + p_size > capacity + rounding_off:
             continue
 
         loc = p["delivery_location_id"]
@@ -352,44 +471,6 @@ def flatten(order: List[str], members: Dict[str, List[str]]) -> List[str]:
         if loc in members:
             result.extend(members[loc])
     return result
-
-
-def plan_trip(parcel: Dict[str, Dict], context: Dict, config: RegionConfig) -> List[str]:
-    """Select and plan the optimal parcel trip for an available vehicle. Time complexity: O(B * L^2 + B log B + P_cand * S^2), where B is the number of batches, L is max locations per batch, P_cand is candidates in a batch, and S is route stops."""
-    region_of = build_regions(context["travel_distance"], config.region_threshold_km)
-    queues = build_queues(parcel, context, region_of)
-    if not queues:
-        return []
-
-    now = context["current_time"]
-    capacity = context["capacity"]
-
-    due = [batch for batch in queues.values() if deadline_due(batch, now)]
-    if not due:
-        return []
-
-    due.sort(key=lambda b: b.latest_dispatch)
-
-    # Calculate required vehicles vs idle vehicles
-    needed = sum(math.ceil(b.load / capacity - EPS) for b in due)
-    idle_count = sum(
-        1 for v_info in context["fleet"].values()
-        if v_info["available_at"] <= now + EPS
-    )
-
-    if needed > idle_count:
-        due.sort(key=lambda b: (-min(b.load, capacity), b.latest_dispatch))
-
-    for batch in due:
-        core = sorted(
-            batch.parcel_ids,
-            key=lambda pid: (parcel_latest_dispatch(parcel[pid], context), pid)
-        )
-        order, members = load_trip(core, parcel, context)
-        if order:
-            return flatten(order, members)
-
-    return []
 
 
 CONFIG = RegionConfig()
