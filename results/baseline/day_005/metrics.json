@@ -1,0 +1,21 @@
+{
+  "on_time_rate": 0.2853598014888337,
+  "delivery_rate": 0.444169,
+  "total_parcels": 806,
+  "on_time_count": 230,
+  "early_count": 0,
+  "late_count": 128,
+  "undelivered_count": 448,
+  "on_time_rate_by_window_type": {
+    "afternoon": 0.0,
+    "open": 0.5542168674698795,
+    "tight": 0.0
+  },
+  "parcels_by_window_type": {
+    "afternoon": 327,
+    "open": 415,
+    "tight": 64
+  },
+  "number_of_trips": 21,
+  "total_distance_km": 5152.386000000001
+}
