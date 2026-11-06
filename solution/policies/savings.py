@@ -527,4 +527,4 @@ def dispatch(parcel, context):
     lookup = {c['parcel_id']: c for c in candidates}
     
     # 9. Verify hard constraints one last time and return the flattened list of parcel IDs
-    return verify_and_return(stops, lookup, context)
+    return verify_and_return(stops, lookup, context) #
