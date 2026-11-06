@@ -91,29 +91,41 @@ def prepare_candidates(parcel, context):
 ## stage 2 triggers ##
 
 def should_send(candidates, context):
-    ## Evaluates whether the current candidates should trigger a dispatch.
-
+    
+    ## Evaluates whether the current candidates should trigger a dispatch 
+    ### based on deadlines, return-cutoff, and fill conditions.
+    
     # 1. Return False if candidates is empty
     if not candidates:
         return False
-
+        
     # 2. Let now = current_time and next_round = now + 10
     now = context['current_time']
     next_round = now + 10.0
-
+    
     # 3. Deadline trigger
     non_fillers = [c for c in candidates if not c['is_filler']]
-
     if non_fillers:
         smallest_latest_dispatch = min(c['latest_dispatch'] for c in non_fillers)
-
-        # The trigger fires if (that value - safety_margin) < next_round
         if (smallest_latest_dispatch - SAFETY_MARGIN) < next_round:
             return True
-
-    # 4. Return-cutoff trigger: for each...
-    # TODO: Implement the rest of the return-cutoff trigger logic here.
-
+            
+    # 4. Return-cutoff trigger
+    for c in candidates:
+        loc = c['location']
+        # Calculate cutoff_latest
+        cutoff_latest = context['return_cutoff'] - (2 * dist('HUB', loc)) - context['departure_delay']
+        if cutoff_latest < next_round:
+            return True
+            
+    # 5. Fill trigger
+    fill_candidates_size = sum(
+        c['size'] for c in candidates if c['earliest_dispatch'] <= now
+    )
+    if fill_candidates_size >= FILL_THRESHOLD * context['capacity']:
+        return True
+        
+    # 6. Otherwise return False
     return False
 
 
